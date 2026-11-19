@@ -1,0 +1,126 @@
+*lsp-cache.txt*  Keep LSP project state outside the repo
+
+==============================================================================
+CONTENTS                                                   *lsp-cache*
+
+  1. Why ................................. |lsp-cache-why|
+  2. Commands ............................ |lsp-cache-commands|
+  3. Project config ...................... |lsp-cache-config|
+  4. Setup ............................... |lsp-cache-setup|
+  5. Cache layout ........................ |lsp-cache-layout|
+
+==============================================================================
+1. WHY                                                     *lsp-cache-why*
+
+clangd and pyright depend on build outputs: compile_commands.json, generated
+headers, the cross toolchain's system headers and a Python venv. `make clean`,
+switching branches or rebuilding a container removes them, and builds that
+run in a container produce paths and interpreters the editor can't use.
+
+lsp-cache snapshots these into a per-project cache under
+`stdpath("state")/lsp-cache/`, and points clangd and pyright at it. Nothing is
+written to the repository, so coworkers aren't affected. Everything is under
+$HOME, so it works the same on the host, in a distrobox/toolbox, or with a
+container that mounts $HOME at the same path.
+
+==============================================================================
+2. COMMANDS                                           *lsp-cache-commands*
+
+                                                           *:LspCache*
+:LspCache sync [--no-venv] [--no-toolchain]
+    Snapshot the current project (the git root of the current buffer):
+    - merge ./compile_commands.json into the cached DB. Entries are keyed by
+      (directory, file), so incremental builds never shrink it, and entries
+      for deleted sources are dropped.
+    - copy `generated_include_dirs`. A missing dir keeps the last copy.
+    - copy the toolchain's system include dirs (`toolchain`).
+    - (re)build the Python venv with uv when the requirements change.
+    Then restart clangd/pyright for that project. Runs asynchronously.
+    In headless mode it waits for the sync to finish, so this works from a
+    shell: >
+        nvim --headless +'LspCache sync' +q
+<
+:LspCache! sync
+    Same as above, but without restarting the LSP clients.
+
+:LspCache status
+    Show the project, its config, what is cached, and the command line or
+    interpreter that each running client uses.
+
+:LspCache edit
+    Open the project's config, creating it from a template if needed.
+
+:LspCache log
+    Show the output of the last sync.
+
+:LspCache clean
+    Delete the project's cache (asks first), then restart its clients.
+
+Also see `:checkhealth lsp-cache`.
+
+==============================================================================
+3. PROJECT CONFIG                                       *lsp-cache-config*
+
+One Lua file per project at `stdpath("config")/lsp-cache/<repo name>.lua`, so
+it travels with your dotfiles. It is optional: without it, only the compile DB
+is cached. Example: >lua
+
+    return {
+      -- Repo-relative dirs with generated headers.
+      generated_include_dirs = { "build/generated" },
+
+      python = {
+        version = "3.11",                       -- any version uv can provide
+        requirements = { "requirements*.txt" }, -- globs, repo-relative
+      },
+
+      -- Cross toolchain whose system headers clangd should use.
+      toolchain = {
+        run = { "podman", "exec", "builder" },  -- prefix; {} runs it directly
+        compilers = { "arm-none-eabi-gcc" },    -- basenames as in the DB
+      },
+    }
+<
+`toolchain`: for every (compiler, language) used in the DB, lsp-cache runs
+`<run…> <cc> -x <lang> -E -v /dev/null`, copies the listed include dirs into
+the cache (from wherever the compiler lives, using the same `run` prefix) and
+adds `--target=<triple> -nostdinc -isystem <copy>…` to those entries. clangd
+then needs neither the toolchain nor `--query-driver`. The copy is keyed by
+`<cc> --version`, so it's only refreshed when the compiler changes.
+
+==============================================================================
+4. SETUP                                                 *lsp-cache-setup*
+
+Requires Neovim 0.11+, `git` and `cp`. `uv` is needed for venvs. >lua
+
+    require("lsp-cache").setup({
+      clangd = {
+        enabled = true,
+        cmd = { "clangd", "--background-index" },
+        -- Only used when no toolchain headers are cached:
+        fallback_args = { "--query-driver=/usr/bin/arm-none-eabi-*" },
+      },
+      python_servers = { "pyright", "basedpyright" },
+      restart_after_sync = true,
+    })
+<
+setup() calls |vim.lsp.config()| for clangd (a function `cmd`, so the flags
+are chosen per project at every start) and for each python server (`on_init`
+sets `settings.python.pythonPath`). Your own vim.lsp.config() calls for these
+servers still merge in, but don't set `cmd` for clangd yourself.
+
+==============================================================================
+5. CACHE LAYOUT                                         *lsp-cache-layout*
+
+`stdpath("state")/lsp-cache/<repo>-<sha256(root):8>/`
+    raw_compile_commands.json   merged DB, as captured
+    compile_commands.json       derived DB that clangd reads
+    gen/                        copies of generated include dirs
+    sysroot/<compiler hash>/    toolchain system headers
+    venv/                       Python venv
+    state.json, last_sync.log
+
+The key is the absolute root path, so each clone or worktree has its own
+cache. Everything in it can be regenerated.
+
+ vim:tw=78:ts=8:ft=help:norl:
